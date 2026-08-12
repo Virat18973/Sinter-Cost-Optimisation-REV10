@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -410,6 +409,67 @@ def dashboard():
             unsafe_allow_html=True
         )
 
+    # ---------- PERMANENT MASTER EXCEL UPLOAD ----------
+    # This is intentionally on the Dashboard itself so the operator can
+    # replace the chemistry source from any dashboard session without
+    # navigating to Upload & Settings.
+    st.markdown(
+        '<div class="panel" style="margin-top:.55rem">'
+        '<div class="panel-title">MASTER RAW MATERIAL CHEMISTRY — EXCEL UPLOAD</div>'
+        '<div class="small">Upload the latest raw-material chemistry Excel here. '
+        'The uploaded file can contain chemistry, Tech Min/Max, Price_Rs_t and Available_Tonnes. '
+        'The current dashboard remains unchanged until you activate the validated file.</div>',
+        unsafe_allow_html=True
+    )
+
+    up_col, status_col = st.columns([2.2, 1], gap="large")
+    with up_col:
+        dashboard_upload = st.file_uploader(
+            "Upload / replace Master Chemistry Excel",
+            type=["xlsx"],
+            key="dashboard_primary_upload",
+            help="Required columns: Material, Group, Fe, SiO2, Al2O3, CaO, MgO, LOI, Tech_Min, Tech_Max. "
+                 "Optional: Price_Rs_t, Available_Tonnes."
+        )
+
+    with status_col:
+        st.markdown(
+            f'<div class="notice" style="margin-top:1.55rem">'
+            f'<b>ACTIVE SOURCE</b><br>{st.session_state.source}'
+            f'<br><span class="small">{len(st.session_state.primary)} primary materials</span>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+    if dashboard_upload is not None:
+        try:
+            uploaded_df = load_primary(dashboard_upload)
+            st.success(
+                f"Excel validated successfully — {len(uploaded_df)} materials found in "
+                f"'{dashboard_upload.name}'."
+            )
+            if st.button(
+                "⬆ ACTIVATE UPLOADED CHEMISTRY",
+                type="primary",
+                use_container_width=True,
+                key="activate_dashboard_primary"
+            ):
+                reset_primary(
+                    uploaded_df,
+                    "Uploaded • " + dashboard_upload.name
+                )
+                st.rerun()
+        except Exception as e:
+            st.error(f"Excel validation failed: {e}")
+
+    st.markdown(
+        '<div class="small" style="margin-top:.35rem">'
+        'Tip: upload a new Excel whenever chemistry changes. Price, RM Stock, Tech Max '
+        'and Availability can then be fine-tuned directly in the dashboard tables below.'
+        '</div></div>',
+        unsafe_allow_html=True
+    )
+
     if result and result["blend"]:
         bd, cost, total = breakdown(result["blend"], result["df"])
         ach = result["achieved"]
@@ -649,7 +709,7 @@ def reports():
     st.download_button("⬇ DOWNLOAD OPTIMIZATION REPORT",bd.to_csv(index=False).encode(),"sinter_optimization_report.csv","text/csv",use_container_width=True)
 
 def settings():
-    page("Upload & Settings","Primary master chemistry only. Alternative chemistry has its own workspace.")
+    page("Upload & Settings","Secondary upload/settings page. The primary Master Chemistry Excel is also permanently available on the Dashboard.")
     a,b=st.columns([1.4,1])
     with a:
         st.markdown('<div class="panel"><div class="panel-title">PRIMARY CHEMISTRY EXCEL</div>',unsafe_allow_html=True)
@@ -663,7 +723,7 @@ def settings():
     with b:
         st.markdown('<div class="panel"><div class="panel-title">SYSTEM</div>',unsafe_allow_html=True)
         if st.button("↺ RESTORE BUILT-IN MASTER",use_container_width=True): reset_primary(get_default_chemistry(),"Built-in Master Chemistry"); st.rerun()
-        st.markdown('<div class="notice">Primary chemistry is read-only after upload. Alternative chemistry remains editable in its dedicated page.</div>',unsafe_allow_html=True); st.markdown('</div>',unsafe_allow_html=True)
+        st.markdown('<div class="notice">Primary chemistry can be uploaded from the Dashboard at any time. After activation, chemistry remains editable in the Dashboard chemistry table.</div>',unsafe_allow_html=True); st.markdown('</div>',unsafe_allow_html=True)
 
 # ---------- ROUTE ----------
 pages={"Dashboard":dashboard,"RM Stock":rm_stock,"Optimization Results":results,"Manual Burden Control":manual,"Alternative Raw Material":alternative,"Burden Composition":lambda:composition("burden"),"Cost Composition":lambda:composition("cost"),"What-if Analysis":whatif,"Bottleneck Analysis":bottleneck,"Reports":reports,"Upload & Settings":settings}
