@@ -53,49 +53,60 @@ def clean_cols(df):
 def load_primary(f):
     df = clean_cols(pd.read_excel(f))
 
-    # The Master Excel is the single source for both chemistry AND
-    # commercial/operational inputs. These columns are therefore mandatory.
-    required_excel_cols = MASTER + ["Price_Rs_t", "Available_Tonnes"]
-    miss = [c for c in required_excel_cols if c not in df.columns]
+    required = MASTER + ["Price_Rs_t", "Available_Tonnes"]
+    miss = [c for c in required if c not in df.columns]
     if miss:
         raise ValueError(
             "Master Excel missing mandatory column(s): " + ", ".join(miss) +
-            ". Price_Rs_t, Available_Tonnes (RM Stock) and Tech_Max must be supplied in Excel."
+            ". Required: Material, Group, Fe, SiO2, Al2O3, CaO, MgO, LOI, "
+            "Tech_Min, Tech_Max, Price_Rs_t, Available_Tonnes."
         )
 
-    df = df[required_excel_cols].copy()
+    type_col = next((c for c in ["Material_Type", "Type", "MaterialType"] if c in df.columns), None)
+    if type_col is None:
+        df["Material_Type"] = "Primary"
+    else:
+        df["Material_Type"] = (
+            df[type_col].astype(str).str.strip().str.lower()
+            .map({"primary": "Primary", "alternative": "Alternative"})
+        )
+        if df["Material_Type"].isna().any():
+            raise ValueError("Material_Type must contain only Primary or Alternative.")
 
+    df = df[required + ["Material_Type"]].copy()
     df["Material"] = df["Material"].astype(str).str.strip()
     df["Group"] = df["Group"].astype(str).str.strip()
 
     if df["Material"].duplicated().any():
-        raise ValueError("Duplicate material names in primary Excel.")
+        raise ValueError("Duplicate material names in Excel.")
     if not set(df["Group"]).issubset(GROUPS):
         raise ValueError("Invalid Group. Use Iron_ore, Flux, Recycle or Fuel.")
 
     df = df.set_index("Material")
-
     for c in MASTER[2:]:
         df[c] = pd.to_numeric(df[c], errors="raise")
 
-    # Commercial / operational values are mandatory in the Master Excel.
     for c in ["Price_Rs_t", "Available_Tonnes", "Tech_Max"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
         if df[c].isna().any():
-            bad = df.index[df[c].isna()].tolist()
-            raise ValueError(
-                f"Column {c} contains blank/non-numeric values for: {', '.join(map(str, bad))}"
-            )
+            raise ValueError(f"{c} contains blank/non-numeric values.")
         if (df[c] < 0).any():
-            bad = df.index[df[c] < 0].tolist()
-            raise ValueError(
-                f"Column {c} cannot contain negative values: {', '.join(map(str, bad))}"
-            )
+            raise ValueError(f"{c} cannot contain negative values.")
 
     return df
 
+
+def split_material_types(df):
+    primary = df.index[df["Material_Type"].eq("Primary")].tolist()
+    alternatives = df.index[df["Material_Type"].eq("Alternative")].tolist()
+    return primary, alternatives
+
 def load_alt(f):
-    df=load_primary(f); df["Group"]="Iron_ore"; return df
+    df = load_primary(f).copy()
+    df["Material_Type"] = "Alternative"
+    df["Group"] = "Iron_ore"
+    return df
+
 
 # ---------- STATE ----------
 if "df" not in st.session_state:
@@ -109,12 +120,40 @@ if "df" not in st.session_state:
     st.session_state.whatif=None; st.session_state.runs=0
 if "nav" not in st.session_state: st.session_state.nav="Dashboard"
 
+# Self-heal sessions created by older dashboard versions.
+if "df" in st.session_state:
+    if "Material_Type" not in st.session_state.df.columns:
+        st.session_state.df["Material_Type"] = "Primary"
+    p, a = split_material_types(st.session_state.df)
+    st.session_state.primary = p
+    st.session_state.alts = a
+    if "alt_on" not in st.session_state:
+        st.session_state.alt_on = {m: False for m in a}
+    else:
+        for m in a:
+            st.session_state.alt_on.setdefault(m, False)
+    if "avail" not in st.session_state:
+        st.session_state.avail = {m: (False if m in a else True) for m in st.session_state.df.index}
+
+
 def reset_primary(df,source):
-    st.session_state.df=df.copy(); st.session_state.source=source
-    st.session_state.primary=list(df.index); st.session_state.alts=[]; st.session_state.alt_on={}
-    st.session_state.avail={m:True for m in df.index}; st.session_state.result=None
-    st.session_state.manual_base=None; st.session_state.manual=None; st.session_state.changed=False
-    st.session_state.whatif=None; st.session_state.runs=0
+    df = df.copy()
+    if "Material_Type" not in df.columns:
+        df["Material_Type"] = "Primary"
+    primary, alternatives = split_material_types(df)
+
+    st.session_state.df = df
+    st.session_state.source = source
+    st.session_state.primary = primary
+    st.session_state.alts = alternatives
+    st.session_state.alt_on = {m: False for m in alternatives}
+    st.session_state.avail = {m: (False if m in alternatives else True) for m in df.index}
+    st.session_state.result = None
+    st.session_state.manual_base = None
+    st.session_state.manual = None
+    st.session_state.changed = False
+    st.session_state.whatif = None
+    st.session_state.runs = 0
 
 def add_alt(df):
     dup=set(df.index)&set(st.session_state.df.index)
@@ -293,45 +332,30 @@ def chemistry_editor(key="dashboard_chemistry"):
 
 
 def primary_editor(key):
-    """Editable material-input table using the exact shared material sequence.
-
-    Primary rows retain their master order, followed by alternative rows.
-    Alternative rows are controlled by Include in Mix and remain visible
-    even when OFF so that the output table can align row-for-row.
-    """
     data = []
-
-    for m in material_sequence(st.session_state.df):
+    for m in st.session_state.primary:
+        if m not in st.session_state.df.index:
+            continue
         r = st.session_state.df.loc[m]
-        is_alt = m in st.session_state.alts
-
         data.append({
             "Material": m,
-            "Type": "Alternative" if is_alt else "Primary",
-            "Availability": (
-                st.session_state.alt_on.get(m, False)
-                if is_alt else st.session_state.avail.get(m, True)
-            ),
+            "Availability": st.session_state.avail.get(m, True),
             "Price (₹/t)": r.Price_Rs_t,
             "RM Stock (t)": r.Available_Tonnes,
             "Tech Max (kg/t)": r.Tech_Max
         })
 
-    n = len(data)
-    editor_height = max(470, 38 * (n + 1) + 20)
-
     ed = st.data_editor(
         pd.DataFrame(data),
         hide_index=True,
         use_container_width=True,
-        height=editor_height,
+        height=max(300, 38 * (len(data) + 1) + 20),
         key=key,
-        disabled=["Material", "Type"],
+        disabled=["Material"],
         column_config={
             "Availability": st.column_config.CheckboxColumn(
-                "Availability / Include ●",
-                help="Primary: availability. Alternative: Include in Mix. "
-                     "OFF excludes the alternative from optimization."
+                "Availability ●",
+                help="OFF excludes this primary material from optimization."
             ),
             "Price (₹/t)": st.column_config.NumberColumn(
                 "Price ₹/t ✎", min_value=0, step=1, format="₹ %.0f"
@@ -345,350 +369,71 @@ def primary_editor(key):
         }
     )
 
-    # Apply edits while preserving the fixed sequence.
     for _, r in ed.iterrows():
         m = r["Material"]
-
         st.session_state.df.loc[m, "Price_Rs_t"] = float(r["Price (₹/t)"])
         st.session_state.df.loc[m, "Available_Tonnes"] = float(r["RM Stock (t)"])
         st.session_state.df.loc[m, "Tech_Max"] = float(r["Tech Max (kg/t)"])
-
-        if m in st.session_state.alts:
-            st.session_state.alt_on[m] = bool(r["Availability"])
-            # Availability passed to the optimizer is controlled by the
-            # explicit Include in Mix toggle for alternatives.
-            st.session_state.avail[m] = bool(r["Availability"])
-        else:
-            st.session_state.avail[m] = bool(r["Availability"])
+        st.session_state.avail[m] = bool(r["Availability"])
 
     st.session_state.changed = True
 
 def alt_editor():
     if not st.session_state.alts:
-        st.info("No alternative material loaded. Upload an alternative chemistry Excel above.")
+        st.info("No alternative materials are loaded. Add Material_Type = Alternative rows to the Master Excel.")
         return
-    data=[]
+
+    data = []
     for m in st.session_state.alts:
-        r=st.session_state.df.loc[m]
-        data.append({"Material":m,"Allow Alternative":st.session_state.alt_on.get(m,False),"Fe":r.Fe,"SiO2":r.SiO2,"Al2O3":r.Al2O3,"CaO":r.CaO,"MgO":r.MgO,"LOI":r.LOI,"Price (₹/t)":r.Price_Rs_t,"RM Stock (t)":r.Available_Tonnes,"Tech Min":r.Tech_Min,"Tech Max (kg/t)":r.Tech_Max})
-    ed=st.data_editor(pd.DataFrame(data),hide_index=True,use_container_width=True,height=330,key="alt_editor",disabled=["Material"],column_config={
-        "Allow Alternative":st.column_config.CheckboxColumn("Allow Alternative",help="ON makes it eligible; it does not force usage."),
-        "Fe":st.column_config.NumberColumn("Fe ✎",min_value=0,step=.01),"SiO2":st.column_config.NumberColumn("SiO₂ ✎",min_value=0,step=.01),
-        "Al2O3":st.column_config.NumberColumn("Al₂O₃ ✎",min_value=0,step=.01),"CaO":st.column_config.NumberColumn("CaO ✎",min_value=0,step=.01),
-        "MgO":st.column_config.NumberColumn("MgO ✎",min_value=0,step=.01),"LOI":st.column_config.NumberColumn("LOI ✎",min_value=0,step=.01),
-        "Price (₹/t)":st.column_config.NumberColumn("Price ₹/t ✎",min_value=0,step=1,format="₹ %.0f"),
-        "RM Stock (t)":st.column_config.NumberColumn("RM Stock t ✎",min_value=0,step=100),
-        "Tech Min":st.column_config.NumberColumn("Tech Min",min_value=0,step=1),
-        "Tech Max (kg/t)":st.column_config.NumberColumn("Tech Max kg/t ✎",min_value=0,step=1)})
-    for _,r in ed.iterrows():
-        m=r.Material; st.session_state.alt_on[m]=bool(r["Allow Alternative"])
-        for c in ["Fe","SiO2","Al2O3","CaO","MgO","LOI"]: st.session_state.df.loc[m,c]=float(r[c])
-        st.session_state.df.loc[m,"Tech_Min"]=float(r["Tech Min"]); st.session_state.df.loc[m,"Tech_Max"]=float(r["Tech Max (kg/t)"])
-        st.session_state.df.loc[m,"Price_Rs_t"]=float(r["Price (₹/t)"]); st.session_state.df.loc[m,"Available_Tonnes"]=float(r["RM Stock (t)"])
-        st.session_state.avail[m]=bool(r["Allow Alternative"])
-    st.session_state.changed=True
+        r = st.session_state.df.loc[m]
+        data.append({
+            "Material": m,
+            "Include in Mix": st.session_state.alt_on.get(m, False),
+            "Fe": r.Fe, "SiO2": r.SiO2, "Al2O3": r.Al2O3,
+            "CaO": r.CaO, "MgO": r.MgO, "LOI": r.LOI,
+            "Price (₹/t)": r.Price_Rs_t,
+            "RM Stock (t)": r.Available_Tonnes,
+            "Tech Min": r.Tech_Min,
+            "Tech Max (kg/t)": r.Tech_Max
+        })
 
-def run(ref=None):
-    cur=active_df(); prev=st.session_state.result["cost"] if st.session_state.result else None
-    x=solve_blend_with_compensation(cur,1000,TARGETS,baseline_blend=ref)
-    st.session_state.result={"status":x[0],"blend":x[1],"cost":x[2],"achieved":x[3],"diagnostics":x[4],"fallback":x[5],"df":cur.copy()}
-    st.session_state.manual_base=x[1].copy() if x[1] else None; st.session_state.manual=x[1].copy() if x[1] else None
-    st.session_state.changed=False; st.session_state.prev_cost=prev; st.session_state.runs+=1
-
-# ---------- SIDEBAR ----------
-with st.sidebar:
-    st.markdown("### BAJAJ MUKAND"); st.markdown('<div class="small">Kalyani Steels × Mukand • Hospet</div>',unsafe_allow_html=True); st.markdown("---")
-    groups=[("WORKSPACE",["Dashboard"]),("OPERATIONS",["RM Stock","Optimization Results","Manual Burden Control","Alternative Raw Material"]),("ANALYSIS",["Burden Composition","Cost Composition","What-if Analysis","Bottleneck Analysis"]),("REPORTING",["Reports"]),("SYSTEM",["Upload & Settings"])]
-    for h,items in groups:
-        st.markdown(f'<div class="navhead">{h}</div>',unsafe_allow_html=True)
-        for item in items:
-            if st.button(item,key="nav_"+item,use_container_width=True,type="primary" if st.session_state.nav==item else "secondary"): st.session_state.nav=item; st.rerun()
-    st.markdown("---")
-    st.markdown(f'<div class="side"><b>DATA</b><br>{st.session_state.source}<br>{len(st.session_state.primary)} primary<br>{len(st.session_state.alts)} alternative<br><br><b>MODEL</b><br>● Ready</div>',unsafe_allow_html=True)
-
-result=st.session_state.result
-good=True if not result else all(quality_checks(result["achieved"],TARGETS).values())
-st.markdown(f'<div style="display:flex;justify-content:space-between;align-items:end"><div><div class="eyebrow">HOSPET ALLOY STEEL PLANT</div><h1>SINTER BURDEN CONTROL</h1><div class="sub">Cost optimization • quality assurance • raw material decision support</div></div><div style="text-align:right"><span class="badge {"ok" if good else "out"}">● {"QUALITY OK" if good else "QUALITY ALERT"}</span><br><span class="small">PLANT: HOSPET • {datetime.now():%d %b %Y %H:%M}</span></div></div>',unsafe_allow_html=True)
-
-# ---------- PAGES ----------
-def quality_kpis(ach):
-    q = quality_table(ach, TARGETS)
-    cols = st.columns(len(q))
-    for col, (_, r) in zip(cols, q.iterrows()):
-        ok = str(r.Status) == "OK"
-        col.markdown(
-            f'<div class="kpi {"kpi-g" if ok else "kpi-r"}">'
-            f'<div class="kpi-label">{r.KPI}</div>'
-            f'<div class="kpi-value">{float(r.Achieved):.3f}</div>'
-            f'<div class="kpi-sub">Target: {r.Target}</div>'
-            f'<span class="badge {"ok" if ok else "out"}">● {r.Status}</span>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
-
-
-def dashboard():
-    # ---------- SAME TOP CONTROL / KPI AREA ----------
-    st.markdown(
-        '<div class="hero"><b>CONTROL ROOM</b>'
-        '<div class="sub">Primary chemistry is editable below after loading the master Excel. '
-        'Price, RM Stock, Tech Max and availability are daily dashboard inputs.</div></div>',
-        unsafe_allow_html=True
-    )
-
-    a, b, c = st.columns([4, 1.5, 1.3])
-    with a:
-        st.markdown(
-            f'<div class="notice"><b>ACTIVE MASTER SOURCE:</b> {st.session_state.source}</div>',
-            unsafe_allow_html=True
-        )
-    with b:
-        if st.button("🚀 RUN OPTIMIZER", type="primary", use_container_width=True):
-            with st.spinner("Optimizing…"):
-                run()
-            st.rerun()
-    with c:
-        st.markdown(
-            f'<div class="notice" style="text-align:center"><b>RUN {st.session_state.runs}</b>'
-            f'<br>{len(st.session_state.alts)} alt. RM</div>',
-            unsafe_allow_html=True
-        )
-
-    if st.session_state.changed:
-        st.markdown(
-            '<div class="notice notice-w" style="margin-top:.5rem">'
-            '△ Inputs changed — run optimizer to apply.</div>',
-            unsafe_allow_html=True
-        )
-
-    # ---------- PERMANENT MASTER EXCEL UPLOAD ----------
-    # This is intentionally on the Dashboard itself so the operator can
-    # replace the chemistry source from any dashboard session without
-    # navigating to Upload & Settings.
-    st.markdown(
-        '<div class="panel" style="margin-top:.55rem">'
-        '<div class="panel-title">MASTER RAW MATERIAL CHEMISTRY — EXCEL UPLOAD</div>'
-        '<div class="small">Upload the latest raw-material chemistry Excel here. '
-        'The uploaded file can contain chemistry, Tech Min/Max, Price_Rs_t and Available_Tonnes. '
-        'The current dashboard remains unchanged until you activate the validated file.</div>',
-        unsafe_allow_html=True
-    )
-
-    up_col, status_col = st.columns([2.2, 1], gap="large")
-    with up_col:
-        dashboard_upload = st.file_uploader(
-            "Upload / replace Master Chemistry Excel",
-            type=["xlsx"],
-            key="dashboard_primary_upload",
-            help="Mandatory columns: Material, Group, Fe, SiO2, Al2O3, CaO, MgO, LOI, "
-                 "Tech_Min, Tech_Max, Price_Rs_t, Available_Tonnes."
-        )
-
-    with status_col:
-        st.markdown(
-            f'<div class="notice" style="margin-top:1.55rem">'
-            f'<b>ACTIVE SOURCE</b><br>{st.session_state.source}'
-            f'<br><span class="small">{len(st.session_state.primary)} primary materials</span>'
-            f'</div>',
-            unsafe_allow_html=True
-        )
-
-    if dashboard_upload is not None:
-        try:
-            uploaded_df = load_primary(dashboard_upload)
-            st.success(
-                f"Excel validated successfully — {len(uploaded_df)} materials found in "
-                f"'{dashboard_upload.name}'."
-            )
-            if st.button(
-                "⬆ ACTIVATE UPLOADED CHEMISTRY",
-                type="primary",
-                use_container_width=True,
-                key="activate_dashboard_primary"
-            ):
-                reset_primary(
-                    uploaded_df,
-                    "Uploaded • " + dashboard_upload.name
-                )
-                st.rerun()
-        except Exception as e:
-            st.error(f"Excel validation failed: {e}")
-
-    st.markdown(
-        '<div class="small" style="margin-top:.35rem">'
-        'Tip: upload a new Excel whenever chemistry changes. Price, RM Stock, Tech Max '
-        'and Availability can then be fine-tuned directly in the dashboard tables below.'
-        '</div></div>',
-        unsafe_allow_html=True
-    )
-
-    if result and result["blend"]:
-        bd, cost, total = breakdown(result["blend"], result["df"])
-        ach = result["achieved"]
-        ok = all(quality_checks(ach, TARGETS).values())
-
-        cards = [
-            ("TOTAL COST", f"₹{cost:,.2f}/t", "Optimized", "kpi-s"),
-            ("TOTAL BURDEN", f"{total:,.1f} kg/t", "Per tonne sinter", "kpi-g"),
-            ("Fe", f"{ach['Fe']:.3f}%", f"{FE_LOWER:.1f}–{FE_UPPER:.1f} target", "kpi-a"),
-            ("QUALITY", "PASS" if ok else "REVIEW", "Mandatory constraints", "kpi-g" if ok else "kpi-r"),
-            ("ALT ORE", "USED" if any(result["blend"].get(m, 0) > 0 for m in st.session_state.alts) else "NOT USED", "Contingency", "kpi-o")
-        ]
-        cc = st.columns(5)
-        for col, (l, v, s, cl) in zip(cc, cards):
-            col.markdown(
-                f'<div class="kpi {cl}"><div class="kpi-label">{l}</div>'
-                f'<div class="kpi-value">{v}</div><div class="kpi-sub">{s}</div></div>',
-                unsafe_allow_html=True
-            )
-
-        # ---------- FULL-WIDTH EDITABLE CHEMISTRY ----------
-        st.write("")
-        st.markdown(
-            '<div class="panel"><div class="panel-title">'
-            'RAW MATERIAL CHEMISTRY — EDITABLE INPUT</div>'
-            '<div class="small">Chemistry loaded from the active Master Chemistry Excel. '
-            'Blue pencil fields are editable. Changes are applied when Run Optimizer is pressed.</div>',
-            unsafe_allow_html=True
-        )
-        chemistry_editor("dashboard_chemistry")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # ---------- INPUTS + OUTPUT, SAME MATERIAL SEQUENCE ----------
-        st.write("")
-        left, right = st.columns([1, 1.45], gap="large")
-
-        with left:
-            st.markdown(
-                '<div class="panel"><div class="panel-title">'
-                'RAW MATERIAL INPUTS — DAILY CONTROL</div>'
-                '<div class="small">Availability • Price • RM Stock • Tech Max</div>',
-                unsafe_allow_html=True
-            )
-            primary_editor("dashboard_primary")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        with right:
-            st.markdown(
-                '<div class="panel"><div class="panel-title">'
-                'OPTIMIZED BURDEN & COST — SAME MATERIAL SEQUENCE</div>'
-                '<div class="small">Rows follow the exact same material order as the input table, '
-                'including alternatives and zero-quantity materials.</div>',
-                unsafe_allow_html=True
-            )
-            st.markdown(table(bd.round(2), {"Cost Rs/t"}), unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        # ---------- ACHIEVED CHEMISTRY AS HORIZONTAL KPI CARDS ----------
-        st.write("")
-        st.markdown(
-            '<div class="panel"><div class="panel-title">CHEMISTRY ACHIEVED</div>',
-            unsafe_allow_html=True
-        )
-        quality_kpis(ach)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # ---------- DONUTS ----------
-        st.write("")
-        a, b = st.columns(2, gap="large")
-
-        gv = {
-            g: sum(
-                result["blend"].get(m, 0)
-                for m in result["blend"]
-                if result["df"].loc[m, "Group"] == g
-            )
-            for g in GROUPS
+    ed = st.data_editor(
+        pd.DataFrame(data),
+        hide_index=True,
+        use_container_width=True,
+        height=max(250, 38 * (len(data) + 1) + 20),
+        key="alt_editor",
+        disabled=["Material"],
+        column_config={
+            "Include in Mix": st.column_config.CheckboxColumn(
+                "Include in Mix ●",
+                help="OFF = completely excluded. ON = eligible, but optimizer does not have to use it."
+            ),
+            "Fe": st.column_config.NumberColumn("Fe ✎", min_value=0, step=.01),
+            "SiO2": st.column_config.NumberColumn("SiO₂ ✎", min_value=0, step=.01),
+            "Al2O3": st.column_config.NumberColumn("Al₂O₃ ✎", min_value=0, step=.01),
+            "CaO": st.column_config.NumberColumn("CaO ✎", min_value=0, step=.01),
+            "MgO": st.column_config.NumberColumn("MgO ✎", min_value=0, step=.01),
+            "LOI": st.column_config.NumberColumn("LOI ✎", min_value=0, step=.01),
+            "Price (₹/t)": st.column_config.NumberColumn("Price ₹/t ✎", min_value=0, step=1, format="₹ %.0f"),
+            "RM Stock (t)": st.column_config.NumberColumn("RM Stock t ✎", min_value=0, step=100),
+            "Tech Min": st.column_config.NumberColumn("Tech Min ✎", min_value=0, step=1),
+            "Tech Max (kg/t)": st.column_config.NumberColumn("Tech Max kg/t ✎", min_value=0, step=1)
         }
-        with a:
-            st.markdown(
-                '<div class="panel"><div class="panel-title">BURDEN COMPOSITION</div>',
-                unsafe_allow_html=True
-            )
-            st.plotly_chart(
-                donut(gv, total, "kg/t"),
-                use_container_width=True,
-                config={"displayModeBar": False}
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
+    )
 
-        gv = {
-            g: sum(
-                result["blend"].get(m, 0) * result["df"].loc[m, "Price_Rs_t"] / 1000
-                for m in result["blend"]
-                if result["df"].loc[m, "Group"] == g
-            )
-            for g in GROUPS
-        }
-        with b:
-            st.markdown(
-                '<div class="panel"><div class="panel-title">COST COMPOSITION</div>',
-                unsafe_allow_html=True
-            )
-            st.plotly_chart(
-                donut(gv, cost, "₹/t"),
-                use_container_width=True,
-                config={"displayModeBar": False}
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
+    for _, r in ed.iterrows():
+        m = r["Material"]
+        st.session_state.alt_on[m] = bool(r["Include in Mix"])
+        for c in ["Fe","SiO2","Al2O3","CaO","MgO","LOI"]:
+            st.session_state.df.loc[m,c] = float(r[c])
+        st.session_state.df.loc[m,"Tech_Min"] = float(r["Tech Min"])
+        st.session_state.df.loc[m,"Tech_Max"] = float(r["Tech Max (kg/t)"])
+        st.session_state.df.loc[m,"Price_Rs_t"] = float(r["Price (₹/t)"])
+        st.session_state.df.loc[m,"Available_Tonnes"] = float(r["RM Stock (t)"])
+        st.session_state.avail[m] = bool(r["Include in Mix"])
 
-    else:
-        st.markdown(
-            '<div class="panel" style="margin-top:.7rem;text-align:center;padding:2rem">'
-            '<b>Optimization workspace ready</b>'
-            '<div class="small">Enter daily inputs and run the optimizer.</div></div>',
-            unsafe_allow_html=True
-        )
-
-        # Show chemistry/input controls even before the first optimization run.
-        st.write("")
-        st.markdown(
-            '<div class="panel"><div class="panel-title">'
-            'RAW MATERIAL CHEMISTRY — EDITABLE INPUT</div>'
-            '<div class="small">Load or restore the master Excel, review chemistry, then run the optimizer.</div>',
-            unsafe_allow_html=True
-        )
-        chemistry_editor("dashboard_chemistry_pre")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.write("")
-        left, right = st.columns([1, 1.45], gap="large")
-        with left:
-            st.markdown(
-                '<div class="panel"><div class="panel-title">'
-                'RAW MATERIAL INPUTS — DAILY CONTROL</div>',
-                unsafe_allow_html=True
-            )
-            primary_editor("dashboard_primary_pre")
-            st.markdown('</div>', unsafe_allow_html=True)
-        with right:
-            st.markdown(
-                '<div class="panel"><div class="panel-title">'
-                'OPTIMIZED BURDEN & COST</div>'
-                '<div class="small">Run optimizer to populate the output.</div></div>',
-                unsafe_allow_html=True
-            )
-
-def rm_stock():
-    page("RM Stock & Commercial Inputs","Daily inputs for primary raw materials.")
-    st.markdown('<div class="notice">✎ Editable: Price • RM Stock • Tech Max • Availability &nbsp; | &nbsp; 🔒 Chemistry / Tech Min</div>',unsafe_allow_html=True); st.write("")
-    st.markdown('<div class="panel"><div class="panel-title">PRIMARY COMMERCIAL MASTER</div>',unsafe_allow_html=True); primary_editor("rm_primary"); st.markdown('</div>',unsafe_allow_html=True)
-
-def alternative():
-    page("Alternative Raw Material","Optional contingency material. Excel chemistry can be uploaded, then edited here.")
-    a,b=st.columns([1.4,1])
-    with a:
-        st.markdown('<div class="panel"><div class="panel-title">UPLOAD ALTERNATIVE CHEMISTRY</div>',unsafe_allow_html=True)
-        f=st.file_uploader("Alternative chemistry Excel",type=["xlsx"],key="alt_upload")
-        st.markdown('<div class="small">Required: Material, Group, Fe, SiO2, Al2O3, CaO, MgO, LOI, Tech_Min, Tech_Max. Group is treated as Iron_ore.</div>',unsafe_allow_html=True)
-        if f:
-            try:
-                alt=load_alt(f); st.success(f"{len(alt)} alternative material(s) validated.")
-                if st.button("ADD TO ALTERNATIVE WORKSPACE",type="primary",use_container_width=True): add_alt(alt); st.rerun()
-            except Exception as e: st.error(str(e))
-        st.markdown('</div>',unsafe_allow_html=True)
-    with b: st.markdown('<div class="panel"><div class="panel-title">OPTIMIZATION RULE</div><div class="notice">ON = eligible. It does not force usage. OFF = completely excluded.</div><div class="small" style="margin-top:.5rem">Alternative chemistry is editable after upload.</div></div>',unsafe_allow_html=True)
-    st.write(""); st.markdown('<div class="panel"><div class="panel-title">ALTERNATIVE MATERIAL INPUTS</div>',unsafe_allow_html=True); alt_editor(); st.markdown('</div>',unsafe_allow_html=True)
+    st.session_state.changed = True
 
 def composition(kind):
     if not result or not result["blend"]: page("Composition","Run optimizer first."); return
@@ -721,8 +466,21 @@ def manual():
     req={}; cols=st.columns(2)
     for i,m in enumerate(adj):
         b=float(base[m]); r=.15 if df.loc[m,"Group"]=="Iron_ore" else .10; mn=max(0,b*(1-r)); mx=max(mn+1,b*(1+r)); key="man_"+m
-        if key not in st.session_state or not mn<=float(st.session_state[key])<=mx: st.session_state[key]=b
-        with cols[i%2]: req[m]=st.slider(f"{m} — kg/t",mn,mx,float(st.session_state[key]),.5,key=key)
+        try:
+            current = float(st.session_state.get(key, b))
+        except (TypeError, ValueError):
+            current = b
+        current = max(float(mn), min(float(current), float(mx)))
+        st.session_state[key] = current
+        with cols[i%2]:
+            req[m] = st.slider(
+                f"{m} — kg/t",
+                min_value=float(mn),
+                max_value=float(mx),
+                value=float(current),
+                step=0.5,
+                key=key
+            )
     adjusted=redistribute_adjustment(base,df,req)
     for m in fixed: adjusted[m]=base[m]
     ach=compute_achieved(adjusted,df,1000); ac=sum(adjusted[m]*df.loc[m,"Price_Rs_t"]/1000 for m in adjusted); bc=float(result["cost"] or 0); total=sum(adjusted); ok=all(quality_checks(ach,TARGETS).values())
