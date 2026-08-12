@@ -435,6 +435,26 @@ def alt_editor():
 
     st.session_state.changed = True
 
+def alternative():
+    page(
+        "Alternative Raw Material",
+        "Contingency materials from the same Master Chemistry Excel."
+    )
+    st.markdown(
+        '<div class="notice">OFF = excluded from optimization. ON = eligible but not forced. '
+        'Chemistry, price, RM Stock and Tech Max are editable here. Material names are taken from the uploaded Excel.</div>',
+        unsafe_allow_html=True
+    )
+    st.write("")
+    st.markdown(
+        '<div class="panel"><div class="panel-title">'
+        'ALTERNATIVE RAW MATERIALS — CONTINGENCY CONTROL</div>',
+        unsafe_allow_html=True
+    )
+    alt_editor()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
 def composition(kind):
     if not result or not result["blend"]: page("Composition","Run optimizer first."); return
     bd,cost,total=breakdown(result["blend"],result["df"]); base=bd[bd.Material!="TOTAL"]
