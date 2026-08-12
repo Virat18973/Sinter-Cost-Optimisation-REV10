@@ -52,13 +52,18 @@ def clean_cols(df):
 
 def load_primary(f):
     df = clean_cols(pd.read_excel(f))
-    miss = [c for c in MASTER if c not in df.columns]
-    if miss:
-        raise ValueError("Primary Excel missing: " + ", ".join(miss))
 
-    # Chemistry + technical limits are mandatory.
-    base_cols = MASTER.copy()
-    df = df[base_cols + [c for c in ["Price_Rs_t", "Available_Tonnes"] if c in df.columns]].copy()
+    # The Master Excel is the single source for both chemistry AND
+    # commercial/operational inputs. These columns are therefore mandatory.
+    required_excel_cols = MASTER + ["Price_Rs_t", "Available_Tonnes"]
+    miss = [c for c in required_excel_cols if c not in df.columns]
+    if miss:
+        raise ValueError(
+            "Master Excel missing mandatory column(s): " + ", ".join(miss) +
+            ". Price_Rs_t, Available_Tonnes (RM Stock) and Tech_Max must be supplied in Excel."
+        )
+
+    df = df[required_excel_cols].copy()
 
     df["Material"] = df["Material"].astype(str).str.strip()
     df["Group"] = df["Group"].astype(str).str.strip()
@@ -73,17 +78,19 @@ def load_primary(f):
     for c in MASTER[2:]:
         df[c] = pd.to_numeric(df[c], errors="raise")
 
-    # Optional commercial values may be supplied in Excel and are still
-    # editable from the dashboard.
-    if "Price_Rs_t" not in df.columns:
-        df["Price_Rs_t"] = 0.0
-    else:
-        df["Price_Rs_t"] = pd.to_numeric(df["Price_Rs_t"], errors="coerce").fillna(0.0)
-
-    if "Available_Tonnes" not in df.columns:
-        df["Available_Tonnes"] = 0.0
-    else:
-        df["Available_Tonnes"] = pd.to_numeric(df["Available_Tonnes"], errors="coerce").fillna(0.0)
+    # Commercial / operational values are mandatory in the Master Excel.
+    for c in ["Price_Rs_t", "Available_Tonnes", "Tech_Max"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+        if df[c].isna().any():
+            bad = df.index[df[c].isna()].tolist()
+            raise ValueError(
+                f"Column {c} contains blank/non-numeric values for: {', '.join(map(str, bad))}"
+            )
+        if (df[c] < 0).any():
+            bad = df.index[df[c] < 0].tolist()
+            raise ValueError(
+                f"Column {c} cannot contain negative values: {', '.join(map(str, bad))}"
+            )
 
     return df
 
@@ -148,25 +155,44 @@ def table(df,money=set(),status=None):
         rows.append(f'<tr class="{cl}">{"".join(cells)}</tr>')
     return '<div class="table-wrap"><table class="pretty"><thead><tr>'+''.join(f"<th>{c}</th>" for c in df.columns)+'</tr></thead><tbody>'+''.join(rows)+'</tbody></table></div>'
 
+def material_sequence(df=None):
+    """Single display/analysis sequence for all material tables.
+
+    Primary materials always retain their original master-Excel order.
+    Alternative materials are appended in their uploaded/master order.
+    No table is allowed to reorder these materials by quantity or cost.
+    """
+    seq = []
+
+    for m in st.session_state.primary:
+        if df is None or m in df.index:
+            seq.append(m)
+
+    for m in st.session_state.alts:
+        if m not in seq and (df is None or m in df.index):
+            seq.append(m)
+
+    return seq
+
+
 def breakdown(blend, df):
     b, c, total = calculate_cost_breakdown(blend, df)
 
-    order = list(st.session_state.primary) + [
-        m for m in st.session_state.alts if m not in st.session_state.primary
-    ]
+    order = material_sequence(df)
     order_pos = {m: i for i, m in enumerate(order)}
 
     rows = []
     for m in order:
         if m not in df.index:
             continue
+
         kg = float(blend.get(m, 0.0))
         price = float(df.loc[m, "Price_Rs_t"])
         cost = kg * price / 1000.0
-        group = str(df.loc[m, "Group"])
+
         rows.append({
             "Material": m,
-            "Group": group,
+            "Group": str(df.loc[m, "Group"]),
             "kg/t": kg,
             "% of Burden": (kg / total * 100.0 if total else 0.0),
             "Cost Rs/t": cost,
@@ -175,10 +201,14 @@ def breakdown(blend, df):
 
     out = pd.DataFrame(rows)
 
-    # Keep all materials in the same sequence as the input tables.
     if len(out):
-        out["_order"] = out["Material"].map(order_pos).fillna(999999)
-        out = out.sort_values("_order").drop(columns="_order")
+        # Absolute material order — never sort by quantity/cost.
+        out["_material_order"] = out["Material"].map(order_pos)
+        out = (
+            out.sort_values("_material_order", kind="stable")
+               .drop(columns="_material_order")
+               .reset_index(drop=True)
+        )
 
     totalrow = pd.DataFrame([{
         "Material": "TOTAL",
@@ -263,16 +293,28 @@ def chemistry_editor(key="dashboard_chemistry"):
 
 
 def primary_editor(key):
+    """Editable material-input table using the exact shared material sequence.
+
+    Primary rows retain their master order, followed by alternative rows.
+    Alternative rows are controlled by Include in Mix and remain visible
+    even when OFF so that the output table can align row-for-row.
+    """
     data = []
-    for m in st.session_state.primary:
+
+    for m in material_sequence(st.session_state.df):
         r = st.session_state.df.loc[m]
+        is_alt = m in st.session_state.alts
+
         data.append({
             "Material": m,
-            "Group": r.Group,
-            "Availability": st.session_state.avail.get(m, True),
+            "Type": "Alternative" if is_alt else "Primary",
+            "Availability": (
+                st.session_state.alt_on.get(m, False)
+                if is_alt else st.session_state.avail.get(m, True)
+            ),
             "Price (₹/t)": r.Price_Rs_t,
             "RM Stock (t)": r.Available_Tonnes,
-            "Tech Max (t/d)": r.Tech_Max
+            "Tech Max (kg/t)": r.Tech_Max
         })
 
     n = len(data)
@@ -284,11 +326,12 @@ def primary_editor(key):
         use_container_width=True,
         height=editor_height,
         key=key,
-        disabled=["Material", "Group"],
+        disabled=["Material", "Type"],
         column_config={
             "Availability": st.column_config.CheckboxColumn(
-                "Availability ●",
-                help="ON = material available for optimization."
+                "Availability / Include ●",
+                help="Primary: availability. Alternative: Include in Mix. "
+                     "OFF excludes the alternative from optimization."
             ),
             "Price (₹/t)": st.column_config.NumberColumn(
                 "Price ₹/t ✎", min_value=0, step=1, format="₹ %.0f"
@@ -296,18 +339,27 @@ def primary_editor(key):
             "RM Stock (t)": st.column_config.NumberColumn(
                 "RM Stock t ✎", min_value=0, step=100, format="%.0f"
             ),
-            "Tech Max (t/d)": st.column_config.NumberColumn(
-                "Tech Max t/d ✎", min_value=0, step=1, format="%.0f"
+            "Tech Max (kg/t)": st.column_config.NumberColumn(
+                "Tech Max kg/t ✎", min_value=0, step=1, format="%.0f"
             )
         }
     )
 
+    # Apply edits while preserving the fixed sequence.
     for _, r in ed.iterrows():
         m = r["Material"]
+
         st.session_state.df.loc[m, "Price_Rs_t"] = float(r["Price (₹/t)"])
         st.session_state.df.loc[m, "Available_Tonnes"] = float(r["RM Stock (t)"])
-        st.session_state.df.loc[m, "Tech_Max"] = float(r["Tech Max (t/d)"])
-        st.session_state.avail[m] = bool(r["Availability"])
+        st.session_state.df.loc[m, "Tech_Max"] = float(r["Tech Max (kg/t)"])
+
+        if m in st.session_state.alts:
+            st.session_state.alt_on[m] = bool(r["Availability"])
+            # Availability passed to the optimizer is controlled by the
+            # explicit Include in Mix toggle for alternatives.
+            st.session_state.avail[m] = bool(r["Availability"])
+        else:
+            st.session_state.avail[m] = bool(r["Availability"])
 
     st.session_state.changed = True
 
@@ -318,7 +370,7 @@ def alt_editor():
     data=[]
     for m in st.session_state.alts:
         r=st.session_state.df.loc[m]
-        data.append({"Material":m,"Allow Alternative":st.session_state.alt_on.get(m,False),"Fe":r.Fe,"SiO2":r.SiO2,"Al2O3":r.Al2O3,"CaO":r.CaO,"MgO":r.MgO,"LOI":r.LOI,"Price (₹/t)":r.Price_Rs_t,"RM Stock (t)":r.Available_Tonnes,"Tech Min":r.Tech_Min,"Tech Max (t/d)":r.Tech_Max})
+        data.append({"Material":m,"Allow Alternative":st.session_state.alt_on.get(m,False),"Fe":r.Fe,"SiO2":r.SiO2,"Al2O3":r.Al2O3,"CaO":r.CaO,"MgO":r.MgO,"LOI":r.LOI,"Price (₹/t)":r.Price_Rs_t,"RM Stock (t)":r.Available_Tonnes,"Tech Min":r.Tech_Min,"Tech Max (kg/t)":r.Tech_Max})
     ed=st.data_editor(pd.DataFrame(data),hide_index=True,use_container_width=True,height=330,key="alt_editor",disabled=["Material"],column_config={
         "Allow Alternative":st.column_config.CheckboxColumn("Allow Alternative",help="ON makes it eligible; it does not force usage."),
         "Fe":st.column_config.NumberColumn("Fe ✎",min_value=0,step=.01),"SiO2":st.column_config.NumberColumn("SiO₂ ✎",min_value=0,step=.01),
@@ -327,11 +379,11 @@ def alt_editor():
         "Price (₹/t)":st.column_config.NumberColumn("Price ₹/t ✎",min_value=0,step=1,format="₹ %.0f"),
         "RM Stock (t)":st.column_config.NumberColumn("RM Stock t ✎",min_value=0,step=100),
         "Tech Min":st.column_config.NumberColumn("Tech Min",min_value=0,step=1),
-        "Tech Max (t/d)":st.column_config.NumberColumn("Tech Max t/d ✎",min_value=0,step=1)})
+        "Tech Max (kg/t)":st.column_config.NumberColumn("Tech Max kg/t ✎",min_value=0,step=1)})
     for _,r in ed.iterrows():
         m=r.Material; st.session_state.alt_on[m]=bool(r["Allow Alternative"])
         for c in ["Fe","SiO2","Al2O3","CaO","MgO","LOI"]: st.session_state.df.loc[m,c]=float(r[c])
-        st.session_state.df.loc[m,"Tech_Min"]=float(r["Tech Min"]); st.session_state.df.loc[m,"Tech_Max"]=float(r["Tech Max (t/d)"])
+        st.session_state.df.loc[m,"Tech_Min"]=float(r["Tech Min"]); st.session_state.df.loc[m,"Tech_Max"]=float(r["Tech Max (kg/t)"])
         st.session_state.df.loc[m,"Price_Rs_t"]=float(r["Price (₹/t)"]); st.session_state.df.loc[m,"Available_Tonnes"]=float(r["RM Stock (t)"])
         st.session_state.avail[m]=bool(r["Allow Alternative"])
     st.session_state.changed=True
@@ -428,8 +480,8 @@ def dashboard():
             "Upload / replace Master Chemistry Excel",
             type=["xlsx"],
             key="dashboard_primary_upload",
-            help="Required columns: Material, Group, Fe, SiO2, Al2O3, CaO, MgO, LOI, Tech_Min, Tech_Max. "
-                 "Optional: Price_Rs_t, Available_Tonnes."
+            help="Mandatory columns: Material, Group, Fe, SiO2, Al2O3, CaO, MgO, LOI, "
+                 "Tech_Min, Tech_Max, Price_Rs_t, Available_Tonnes."
         )
 
     with status_col:
@@ -519,7 +571,9 @@ def dashboard():
         with right:
             st.markdown(
                 '<div class="panel"><div class="panel-title">'
-                'OPTIMIZED BURDEN & COST — SAME MATERIAL SEQUENCE</div>',
+                'OPTIMIZED BURDEN & COST — SAME MATERIAL SEQUENCE</div>'
+                '<div class="small">Rows follow the exact same material order as the input table, '
+                'including alternatives and zero-quantity materials.</div>',
                 unsafe_allow_html=True
             )
             st.markdown(table(bd.round(2), {"Cost Rs/t"}), unsafe_allow_html=True)
